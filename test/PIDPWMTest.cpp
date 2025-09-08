@@ -1,72 +1,42 @@
-/* ************************************************************************
- * AeroHalo PIDPWMTest Firmware
- * (c) 2025 AeroHalo - Dr. Richard Day
- *
- * Purpose:
- *   Closed-loop fan speed control using PI + feed-forward.
- *   Target RPM is hard-coded (default: 150 RPM).
- *
- * Hardware:
- *   FAN_PWM_PIN  = D9  (OC1A / Timer1, ~25 kHz PWM, active-low/open-collector)
- *   TACH_PIN     = D3  (INT1, tachometer input, PPR=2 typical)
- *
- * Features:
- *   - 25 kHz PWM generation (Intel 4-wire fan spec)
- *   - RPM measurement via tach ISR
- *   - PI + feed-forward control loop at ~5 Hz
- *   - Duty clamping, minimum-run threshold, slew rate limiting
- *   - Serial debug output: "RPM=<value>, duty=<fraction>"
- *
- * Notes:
- *   - Adjust TARGET_RPM to change the control setpoint.
- *   - Requires 12 V supply for the Arctic P9 PWM fan.
- *   - Open-collector PWM drive with pull-up to 5 V.
- ************************************************************************ */
-
 #include <Arduino.h>
 
-/* ===================== Pin plan ===================== */
-#define FAN_PWM_PIN      9   // D9, OC1A, Timer1 ~25 kHz
-#define TACH_PIN         3   // D3, INT1 (tach input)
+/* ************************************************************************
+ * AeroHalo PIDPWMTest Firmware  (fix: avoid OCR1A = 0 or TOP)
+ * D9 = OC1A (Timer1 @ 25 kHz), D3 = tach
+ ************************************************************************ */
 
-/* ===================== User settings ===================== */
-#define ACTIVE_LOW        1      // 1: inverting (low=ON, open-collector style)
-#define PPR               2      // tach pulses per revolution
+#define FAN_PWM_PIN      9   // D9, OC1A
+#define TACH_PIN         3   // D3, INT1
+#define ACTIVE_LOW        1   // 1: inverting for open-collector (fan PWM active-low)
+#define PPR               2
 #define TARGET_RPM     150.0f
 
-// Control cadence ~5 Hz
-#define PID_DT_S        0.20f    // 200 ms
-#define RPM_WIN_MS        200    // update window in ms
+#define PID_DT_S        0.20f
+#define RPM_WIN_MS        200
 
-// Duty guards & shaping
-#define DUTY_MIN_RUN     0.40f   // fraction (0.40 = 40%)
-#define SLEW_UP_PER_S    2.0f    // duty fraction per second (200%/s)
-#define SLEW_DN_PER_S    4.0f    // duty fraction per second
+#define DUTY_MIN_RUN     0.40f
+#define SLEW_UP_PER_S    2.0f
+#define SLEW_DN_PER_S    4.0f
 
-// Feed-forward from your measured map: duty = a*RPM + b
 #define FF_A            0.001228f
 #define FF_B            0.3758f
 
-// PI gains (D=0 for low RPM)
 #define KP              0.10f
 #define KI              0.01f
 #define I_MIN          -0.15f
 #define I_MAX           0.15f
 
-/* ===================== Tach capture state ===================== */
 volatile unsigned long g_tachEdges = 0;
 volatile unsigned long g_lastEdgeUs = 0;
 
-/* ===================== ISR ===================== */
 static void tachISR() {
   unsigned long now = micros();
-  if (now - g_lastEdgeUs >= 50) { // deglitch: ignore pulses <50us
+  if (now - g_lastEdgeUs >= 50) {
     g_tachEdges++;
     g_lastEdgeUs = now;
   }
 }
 
-/* ===================== RPM computation ===================== */
 static float rpmComputeWindowed() {
   static unsigned long lastMs = 0;
   unsigned long nowMs = millis();
@@ -80,45 +50,65 @@ static float rpmComputeWindowed() {
   lastMs = nowMs;
 
   float window_s = RPM_WIN_MS / 1000.0f;
-  float Hz = edges / window_s;            // edges per second
+  float Hz = edges / window_s;
   if (PPR <= 0) return 0.0f;
-  float rpm = (Hz * 60.0f) / float(PPR);  // RPM
-  return rpm;
+  return (Hz * 60.0f) / float(PPR);
 }
 
-/* ===================== Timer1 @ 25 kHz (OC1A on D9) ===================== */
-static const uint16_t PWM_TOP = 639; // 16e6 / (1*(1+639)) = 25 kHz
+/* ===== Timer1 @ 25 kHz (OC1A on D9) ===== */
+static const uint16_t PWM_TOP = 639; // 16MHz/(1*(1+639)) = 25kHz
+
+static inline uint16_t clamp16(uint16_t x, uint16_t lo, uint16_t hi) {
+  return x < lo ? lo : (x > hi ? hi : x);
+}
 
 static void timer1_init_25kHz_pwm(void) {
-  pinMode(FAN_PWM_PIN, OUTPUT);
+  pinMode(FAN_PWM_PIN, OUTPUT);   // PB1 as output
 
-  // Fast PWM, TOP = ICR1
+  // Fast PWM, mode 14: TOP=ICR1
   TCCR1A = 0;
   TCCR1B = 0;
   TCCR1A |= _BV(WGM11);
   TCCR1B |= _BV(WGM13) | _BV(WGM12);
 
   if (ACTIVE_LOW) {
-    TCCR1A |= _BV(COM1A1) | _BV(COM1A0); // inverting mode
+    TCCR1A |= _BV(COM1A1) | _BV(COM1A0);  // inverting
   } else {
-    TCCR1A |= _BV(COM1A1); // non-inverting
+    TCCR1A |= _BV(COM1A1);                // non-inverting
   }
 
   ICR1 = PWM_TOP;
-  OCR1A = ACTIVE_LOW ? PWM_TOP : 0;
 
-  TCCR1B |= _BV(CS10); // prescaler = 1
+  // Start at true 0% duty **without** writing exact 0 or TOP
+  // In inverting mode, 0% (fan fully off) means OCR1A≈TOP; use TOP-1.
+  // In non-inverting, 0% means OCR1A≈0; use 1.
+  OCR1A = ACTIVE_LOW ? (PWM_TOP - 1) : 1;
+
+  // clk/1
+  TCCR1B |= _BV(CS10);
 }
 
-/* Map duty fraction (0..1) to OCR1A */
+/* Map 0..1 duty fraction to OCR1A, avoiding 0 and TOP */
 static uint16_t fracToOCR1A(float dutyFrac) {
-  if (dutyFrac <= 0.0f) return ACTIVE_LOW ? PWM_TOP : 0;
-  if (dutyFrac >= 1.0f) return ACTIVE_LOW ? 0 : PWM_TOP;
-  uint16_t c = (uint16_t)(dutyFrac * PWM_TOP + 0.5f);
-  return ACTIVE_LOW ? (PWM_TOP - c) : c;
+  if (dutyFrac <= 0.0f) {
+    return ACTIVE_LOW ? (PWM_TOP - 1) : 1;
+  }
+  if (dutyFrac >= 1.0f) {
+    return ACTIVE_LOW ? 1 : (PWM_TOP - 1);
+  }
+
+  // Scale to ticks
+  float ticksF = dutyFrac * PWM_TOP;
+  uint16_t ticks = (uint16_t)(ticksF + 0.5f);
+
+  // Convert for inverting vs non-inverting
+  uint16_t ocr = ACTIVE_LOW ? (PWM_TOP - ticks) : ticks;
+
+  // HARD CLAMP to [1 .. TOP-1]
+  return clamp16(ocr, 1, PWM_TOP - 1);
 }
 
-/* ===================== Duty write with slew ===================== */
+/* ===== Duty write with slew ===== */
 static float g_prevDuty = 0.0f;
 static unsigned long g_lastDutyMs = 0;
 
@@ -139,11 +129,12 @@ static void writeDutyFrac(float target) {
   if (u > g_prevDuty + maxUp) u = g_prevDuty + maxUp;
   if (u < g_prevDuty - maxDn) u = g_prevDuty - maxDn;
 
-  OCR1A = fracToOCR1A(u);
+  uint16_t ocr = fracToOCR1A(u);
+  OCR1A = ocr;
   g_prevDuty = u;
 }
 
-/* ===================== PI + feed-forward ===================== */
+/* ===== PI + feed-forward ===== */
 static float g_integrator = 0.0f;
 
 static float controlStep(float setpointRPM, float measuredRPM) {
@@ -160,11 +151,10 @@ static float controlStep(float setpointRPM, float measuredRPM) {
   return u;
 }
 
-/* ===================== Setup / Loop ===================== */
 void setup() {
   Serial.begin(115200);
   delay(200);
-  Serial.println(F("\n--- PIDPWMTest (Nano): D9 PWM 25kHz, D3 tach ---"));
+  Serial.println(F("\n--- PIDPWMTest (Nano): D9 PWM 25kHz, D3 tach (edge-safe) ---"));
 
   timer1_init_25kHz_pwm();
 
@@ -183,7 +173,11 @@ void loop() {
     Serial.print(F("RPM="));
     Serial.print(rpm, 0);
     Serial.print(F(", duty="));
-    Serial.println(g_prevDuty, 3);
+    Serial.print(g_prevDuty, 3);
+    Serial.print(F(", OCR1A="));
+    Serial.print(OCR1A);
+    Serial.print(F("/"));
+    Serial.println(PWM_TOP);
   }
 
   if (now - lastCtlMs >= (unsigned long)(PID_DT_S * 1000.0f)) {
