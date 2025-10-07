@@ -29,21 +29,21 @@ static const uint16_t PWM_TOP      = 639;    // 25 kHz @ 16 MHz, prescale=1
 
 /* -------- Tach / target / cadence -------- */
 #define PPR                2            // pulses per revolution
-#define TARGET_RPM     70.0f
+#define TARGET_RPM     64.0f
 #define PID_DT_S        0.20f          // controller step = 5 Hz
 #define UI_MS            300           // print/blink cadence
 
 /* -------- Blink band -------- */
-#define RPM_TOL_PCT       0.02f        // ±2%
+#define RPM_TOL_PCT       0.1f        // ±10%
 #define BLINK_MS            50
 
 /* -------- Simple PID gains (duty-per-RPM units) -------- */
-#define KP_DUTY_PER_RPM      0.020f   // 100 RPM error -> 0.20 duty change
-#define KI_DUTY_PER_RPM_S    0.001f   // integral strength (start low)
-#define KD_DUTY_PER_RPM_S    0.0001f   // keep 0.0 initially
+#define KP_DUTY_PER_RPM      0.005f   // 100 RPM error -> 0.010 duty change
+#define KI_DUTY_PER_RPM_S    0.002f   // integral strength (start low)
+#define KD_DUTY_PER_RPM_S    0.0005f   // keep 0.0 initially
 
 /* -------- Duty clamps (keep simple) -------- */
-#define DUTY_MIN_FRAC        0.25f     // set >0 if you need a spin guarantee
+#define DUTY_MIN_FRAC        0.36f     // set >0 if you need a spin guarantee
 #define DUTY_MAX_FRAC        1.000f
 
 /* -------- Tach period capture (interrupt-driven) -------- */
@@ -188,7 +188,8 @@ void loop() {
     const bool inBand = (fabsf(lastRPM - TARGET_RPM) <= tol);
     if (inBand) {
       digitalWrite(LED_BLINK_PIN, HIGH);
-      delay(BLINK_MS);
+    } else
+    {
       digitalWrite(LED_BLINK_PIN, LOW);
     }
 
