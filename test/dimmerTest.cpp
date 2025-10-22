@@ -1,5 +1,5 @@
 // ************************************************************************
-// * AeroHalo Test Software
+// * AeroHalo Test Software - one channel
 // * (c) 2025 AeroHalo - Dr. Richard Day
 // * Version 1.0
 // * Dimmer test                                                        
