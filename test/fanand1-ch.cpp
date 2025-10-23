@@ -76,48 +76,99 @@ static float rpmReadPeriodic() {
   return (60.0f * 1000000.0f) / (float(periodUs) * float(PPR));
 }
 
-// ---------- Soft PWM init ----------
-void d7PwmInit() {
-  pinMode(LED2_PIN, OUTPUT);
-  // Timer2 in CTC mode @ ~16 kHz ISR rate
-  TCCR2A = _BV(WGM21);
-  TCCR2B = _BV(CS21);      // prescaler = 8
-  OCR2A  = 124;            // 16e6 / (8 * (124+1)) = 16 kHz
-  TIMSK2 = _BV(OCIE2A);    // enable compare match A interrupt
-}
+/* ------------------ Timer1 @ 25 kHz on D9 ------------------ */
+static void timer1_init_25k_oc1a(bool inverted) {
+  DDRB |= _BV(DDB1);                // D9 as output
 
-// ---------- Set brightness for D7 (0–255) ----------
-void setLed2Brightness(uint8_t level) {
-  // Map 0–255 -> 0–SOFTPWM_RES
-  d7Duty = (uint8_t)((uint16_t)level * SOFTPWM_RES / 255);
-}
+  TCCR1A = 0;
+  TCCR1B = 0;
 
-// ---------- Fade helper ----------
-void fadeLED(uint8_t pin) {
-  for (int i = 0; i <= fadeSteps; i++) {
-    if (pin == LED2_PIN)
-      setLed2Brightness(i);
-    else
-      analogWrite(pin, i);
-    delay(fadeDelay);
+  if (inverted) {
+    TCCR1A |= _BV(COM1A1) | _BV(COM1A0);   // inverting
+  } else {
+    TCCR1A |= _BV(COM1A1);                 // non-inverting
   }
-  for (int i = fadeSteps; i >= 0; i--) {
-    if (pin == LED2_PIN)
-      setLed2Brightness(i);
-    else
-      analogWrite(pin, i);
-    delay(fadeDelay);
-  }
-  delay(500);
+
+  TCCR1A |= _BV(WGM11);
+  TCCR1B |= _BV(WGM13) | _BV(WGM12);       // Fast PWM, TOP = ICR1 (mode 14)
+  TCCR1B |= _BV(CS10);                     // clk/1
+
+  ICR1  = PWM_TOP;
+  OCR1A = 1;                               // avoid exact 0/TOP
 }
 
+static inline uint16_t map255_to_top_safe(uint8_t duty0_255) {
+  uint32_t ticks = (uint32_t)duty0_255 * (PWM_TOP + 1) / 255u;
+  if (ticks == 0)        ticks = 1;
+  if (ticks >= PWM_TOP)  ticks = PWM_TOP - 1;
+  return (uint16_t)ticks;
+}
+
+static void set_pwm_0_255(uint8_t duty) {
+  OCR1A = map255_to_top_safe(duty);
+}
+
+/* ------------------ SIMPLE PI(D) CONTROLLER ------------------ */
+static float g_integral  = 0.0f;     // duty fraction
+static float g_prevErr   = 0.0f;     // RPM
+static float g_prevDuty  = 0.0f;     // duty fraction 0..1
+
+static float clampf(float x, float lo, float hi) {
+  if (x < lo) return lo;
+  if (x > hi) return hi;
+  return x;
+}
+
+// Return new duty fraction 0..1
+static float simplePID_step(float setRPM, float measRPM, float dt)
+{
+  const float e = setRPM - measRPM;                     // RPM error
+  const float dedt = (dt > 1e-6f) ? (e - g_prevErr) / dt : 0.0f;
+
+  // Tentative integral update
+  float integ_new = g_integral + (KI_DUTY_PER_RPM_S * e * dt);
+
+  // Unsaturated control (duty fraction)
+  float u_unsat =
+      (KP_DUTY_PER_RPM * e)
+    + integ_new
+    + (KD_DUTY_PER_RPM_S * dedt);
+
+  // Saturate
+  float u_sat = clampf(u_unsat, DUTY_MIN_FRAC, DUTY_MAX_FRAC);
+
+  // Conditional anti-windup
+  const bool sat_hi = (u_unsat > DUTY_MAX_FRAC);
+  const bool sat_lo = (u_unsat < DUTY_MIN_FRAC);
+  if ((sat_hi && e > 0.0f) || (sat_lo && e < 0.0f)) {
+    integ_new = g_integral;  // undo if pushing further into clamp
+  }
+
+  g_integral = integ_new;
+  g_prevErr  = e;
+  return u_sat;
+}
+
+/* ------------------ Arduino setup/loop ------------------ */
 void setup() {
-  pinMode(LED1_PIN, OUTPUT);
-  pinMode(LED3_PIN, OUTPUT);
-  analogWrite(LED1_PIN, 0);
-  analogWrite(LED3_PIN, 0);
+  pinMode(LED_BLINK_PIN, OUTPUT);
+  digitalWrite(LED_BLINK_PIN, LOW);
 
-  d7PwmInit();              // start soft-PWM on D7
+  Serial.begin(115200);
+  delay(200);
+  Serial.println(F("\n--- AeroHalo SIMPLE PID + PERIOD RPM @ 25 kHz (D9) ---"));
+
+  timer1_init_25k_oc1a(PWM_INVERTED);
+
+  pinMode(TACH_PIN, INPUT_PULLUP);               // + external 10k to 5V
+  attachInterrupt(digitalPinToInterrupt(TACH_PIN), tachISR, FALLING);
+
+  g_lastEdgeUs = micros();
+  g_lastEdgeMs = millis();
+
+  g_integral = 0.0f;
+  g_prevErr  = 0.0f;
+  g_prevDuty = 0.0f;
 }
 
 void loop() {
