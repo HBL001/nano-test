@@ -1,8 +1,11 @@
 #include <Arduino.h>
 
-// AeroHalo LED bank tester
-// D5, D7, D10 each driven as independent PWM outputs.
-// Turns each LED bank on for 2 s, then off.
+// ************************************************************************
+// * AeroHalo Test Software - AeroHalo LED bank tester
+// * (c) 2025 AeroHalo - Dr. Richard Day
+// * Version 1.0 - D5, D7, D10 each driven as independent PWM outputs
+// * Dimmer test - Turns each LED bank on for 2 s, then off.                                                    
+// ************************************************************************
 
 #define LED1_PIN 5   // LED bank 1 (PWM on Timer0B)
 #define LED2_PIN 7   // LED bank 2 (soft-PWM or digital)
